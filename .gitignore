@@ -1,2 +1,4 @@
 ge/build
 .history
+.cursor
+.code-workspace
