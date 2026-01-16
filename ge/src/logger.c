@@ -1,19 +1,60 @@
-#include "client.h"
+#include "logger.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <uv.h>
 
-static int ensure_directory(const char* path) {
-    uv_fs_t req;
-    int r = uv_fs_mkdir(uv_default_loop(), &req, path, 0755, NULL);
-    uv_fs_req_cleanup(&req);
-    if (r == 0 || r == UV_EEXIST) {
+// Log queue structures
+typedef struct log_node {
+    struct log_node* next;
+    size_t len;
+    char data[1];
+} log_node_t;
+
+typedef struct log_queue {
+    uv_mutex_t mutex;
+    uv_cond_t cond_not_empty;
+    uv_cond_t cond_not_full;
+    log_node_t* head;
+    log_node_t* tail;
+    int running;
+    int initialized;
+    FILE* fp;
+    uv_thread_t thread;
+    int thread_started;
+    size_t count;
+    size_t max_count;
+    size_t warn_threshold;
+    int warn_emitted;
+} log_queue_t;
+
+// Global state
+static log_queue_t g_log_queue = {0};
+static int g_log_ready = 0;
+static char g_log_file_path[1216];
+static size_t g_log_queue_max = 10000;
+static size_t g_log_queue_warn = 8000;
+static const char* g_process_type = "server";
+
+// Helper: case-insensitive string comparison
+static int equals_ignore_case(const char* a, const char* b) {
+    if (!a || !b) {
         return 0;
     }
-    return -1;
+    while (*a != '\0' && *b != '\0') {
+        unsigned char ca = (unsigned char)*a;
+        unsigned char cb = (unsigned char)*b;
+        if (tolower(ca) != tolower(cb)) {
+            return 0;
+        }
+        ++a;
+        ++b;
+    }
+    return *a == '\0' && *b == '\0';
 }
 
+// Helper: find last path separator
 static char* find_last_path_sep(char* path) {
     char* slash = strrchr(path, '/');
     char* backslash = strrchr(path, '\\');
@@ -26,6 +67,18 @@ static char* find_last_path_sep(char* path) {
     return (slash > backslash) ? slash : backslash;
 }
 
+// Helper: ensure directory exists
+static int ensure_directory(const char* path) {
+    uv_fs_t req;
+    int r = uv_fs_mkdir(uv_default_loop(), &req, path, 0755, NULL);
+    uv_fs_req_cleanup(&req);
+    if (r == 0 || r == UV_EEXIST) {
+        return 0;
+    }
+    return -1;
+}
+
+// Helper: get project root directory
 static void get_project_root(char* buffer, size_t buffer_size) {
     char exe_path[1024];
     size_t exe_size = sizeof(exe_path);
@@ -51,7 +104,8 @@ static void get_project_root(char* buffer, size_t buffer_size) {
     }
 }
 
-static int init_log_paths(char* client_file, size_t client_size) {
+// Helper: initialize log file paths
+static int init_log_paths(const char* process_type) {
 #ifdef _WIN32
     const char sep = '\\';
 #else
@@ -62,44 +116,29 @@ static int init_log_paths(char* client_file, size_t client_size) {
     get_project_root(project_root, sizeof(project_root));
 
     char log_dir[1152];
-    char client_dir[1184];
+    char type_dir[1184];
     snprintf(log_dir, sizeof(log_dir), "%s%c%s", project_root, sep, "log");
-    snprintf(client_dir, sizeof(client_dir), "%s%c%s", log_dir, sep, "client");
-    snprintf(client_file, client_size, "%s%c%s", client_dir, sep, "client.log");
+    snprintf(type_dir, sizeof(type_dir), "%s%c%s", log_dir, sep, process_type);
+    snprintf(g_log_file_path, sizeof(g_log_file_path), "%s%c%s.log", type_dir, sep, process_type);
 
-    if (ensure_directory(log_dir) != 0 || ensure_directory(client_dir) != 0) {
+    if (ensure_directory(log_dir) != 0 || ensure_directory(type_dir) != 0) {
         return -1;
     }
     return 0;
 }
 
-typedef struct log_node {
-    struct log_node* next;
-    size_t len;
-    char data[1];
-} log_node_t;
+// Helper: format timestamp
+static void format_timestamp(char* buffer, size_t buffer_size) {
+    uv_timespec64_t ts;
+    if (uv_clock_gettime(UV_CLOCK_REALTIME, &ts) != 0) {
+        snprintf(buffer, buffer_size, "0");
+        return;
+    }
+    long long ms = (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000LL);
+    snprintf(buffer, buffer_size, "%lld", ms);
+}
 
-typedef struct log_queue {
-    uv_mutex_t mutex;
-    uv_cond_t cond_not_empty;
-    uv_cond_t cond_not_full;
-    log_node_t* head;
-    log_node_t* tail;
-    int running;
-    int initialized;
-    FILE* fp;
-    uv_thread_t thread;
-    int thread_started;
-    size_t count;
-    size_t max_count;
-    size_t warn_threshold;
-    int warn_emitted;
-} log_queue_t;
-
-static log_queue_t g_log_queue = {0};
-static int g_log_ready = 0;
-static char g_client_log_file[1216];
-
+// Log queue worker thread
 static void log_queue_worker(void* arg) {
     log_queue_t* q = (log_queue_t*)arg;
     uv_mutex_lock(&q->mutex);
@@ -133,6 +172,7 @@ static void log_queue_worker(void* arg) {
     uv_mutex_unlock(&q->mutex);
 }
 
+// Initialize log queue
 static int log_queue_init(log_queue_t* q, const char* file_path) {
     if (q->initialized) {
         return q->fp ? 0 : -1;
@@ -161,8 +201,11 @@ static int log_queue_init(log_queue_t* q, const char* file_path) {
     q->running = 1;
     q->initialized = 1;
     q->count = 0;
-    q->max_count = 10000;
-    q->warn_threshold = 8000;
+    q->max_count = g_log_queue_max > 0 ? g_log_queue_max : 10000;
+    q->warn_threshold = g_log_queue_warn > 0 ? g_log_queue_warn : 8000;
+    if (q->warn_threshold > q->max_count) {
+        q->warn_threshold = q->max_count;
+    }
     q->warn_emitted = 0;
     if (uv_thread_create(&q->thread, log_queue_worker, q) != 0) {
         fclose(q->fp);
@@ -178,6 +221,7 @@ static int log_queue_init(log_queue_t* q, const char* file_path) {
     return 0;
 }
 
+// Push log to queue
 static void log_queue_push(log_queue_t* q, const char* line, size_t len) {
     if (!q->initialized || !q->fp) {
         return;
@@ -215,6 +259,7 @@ static void log_queue_push(log_queue_t* q, const char* line, size_t len) {
     uv_mutex_unlock(&q->mutex);
 }
 
+// Shutdown log queue
 static void log_queue_shutdown(log_queue_t* q) {
     if (!q->initialized) {
         return;
@@ -244,93 +289,73 @@ static void log_queue_shutdown(log_queue_t* q) {
     q->count = 0;
 }
 
-void log_shutdown(void) {
-    log_queue_shutdown(&g_log_queue);
-    g_log_ready = 0;
-}
+// Public API implementations
 
-// Send data to server (Lua binding)
-static int lua_send_data(lua_State* L) {
-    client_context_t* ctx = (client_context_t*)lua_touserdata(L, lua_upvalueindex(1));
-    size_t len;
-    const char* data = luaL_checklstring(L, 1, &len);
-    
-    if (!ctx || !ctx->connected) {
-        lua_pushboolean(L, 0);
-        lua_pushstring(L, "Not connected");
-        return 2;
+const char* logger_level_to_string(log_level_t level) {
+    switch (level) {
+        case LOG_LEVEL_DEBUG: return "DEBUG";
+        case LOG_LEVEL_INFO: return "INFO";
+        case LOG_LEVEL_WARN: return "WARN";
+        case LOG_LEVEL_ERROR: return "ERROR";
+        case LOG_LEVEL_FATAL: return "FATAL";
+        default: return "INFO";
     }
-    
-    int r = client_send(ctx, data, len);
-    
-    lua_pushboolean(L, r == 0);
-    if (r != 0) {
-        lua_pushstring(L, uv_strerror(r));
-        return 2;
+}
+
+log_level_t logger_parse_level(const char* level_str) {
+    if (!level_str) {
+        return LOG_LEVEL_INFO;
     }
-    
-    return 1;
+    if (equals_ignore_case(level_str, "debug")) return LOG_LEVEL_DEBUG;
+    if (equals_ignore_case(level_str, "info")) return LOG_LEVEL_INFO;
+    if (equals_ignore_case(level_str, "warn")) return LOG_LEVEL_WARN;
+    if (equals_ignore_case(level_str, "error")) return LOG_LEVEL_ERROR;
+    if (equals_ignore_case(level_str, "fatal")) return LOG_LEVEL_FATAL;
+    return LOG_LEVEL_INFO;
 }
 
-// Check connection status (Lua binding)
-static int lua_is_connected(lua_State* L) {
-    client_context_t* ctx = (client_context_t*)lua_touserdata(L, lua_upvalueindex(1));
-    lua_pushboolean(L, ctx && ctx->connected);
-    return 1;
-}
-
-// Disconnect from server (Lua binding)
-static int lua_disconnect(lua_State* L) {
-    client_context_t* ctx = (client_context_t*)lua_touserdata(L, lua_upvalueindex(1));
-    if (ctx) {
-        client_disconnect(ctx);
+void logger_init(const char* process_type) {
+    if (process_type) {
+        g_process_type = process_type;
     }
-    lua_pushboolean(L, 1);
-    return 1;
 }
 
-// Print log (Lua binding)
-static int lua_log(lua_State* L) {
-    const char* msg = luaL_checkstring(L, 1);
-    char log_line[2048];
-    snprintf(log_line, sizeof(log_line), "[Client] %s\n", msg);
-    fputs(log_line, stdout);
-    fflush(stdout);
-
+void logger_set_queue_params(size_t max_count, size_t warn_threshold) {
     if (!g_log_ready) {
-        g_log_ready = (init_log_paths(g_client_log_file, sizeof(g_client_log_file)) == 0) &&
-                      (log_queue_init(&g_log_queue, g_client_log_file) == 0);
+        g_log_queue_max = max_count > 0 ? max_count : 10000;
+        g_log_queue_warn = warn_threshold > 0 ? warn_threshold : 8000;
+        if (g_log_queue_warn > g_log_queue_max) {
+            g_log_queue_warn = g_log_queue_max * 8 / 10;
+        }
     }
+}
+
+void logger_write(log_level_t level, const char* message) {
+    const char* level_label = logger_level_to_string(level);
+    char timestamp[32];
+    char log_line[2048];
+
+    format_timestamp(timestamp, sizeof(timestamp));
+    snprintf(log_line, sizeof(log_line), "[%s] [%s] %s\n", timestamp, level_label, message);
+
+    // Output to console
+    FILE* out = (level >= LOG_LEVEL_ERROR) ? stderr : stdout;
+    fputs(log_line, out);
+    fflush(out);
+
+    // Initialize queue if needed
+    if (!g_log_ready) {
+        g_log_ready = (init_log_paths(g_process_type) == 0) &&
+                      (log_queue_init(&g_log_queue, g_log_file_path) == 0);
+    }
+    
+    // Write to file queue
     if (g_log_ready) {
         log_queue_push(&g_log_queue, log_line, strlen(log_line));
     }
-    return 0;
 }
 
-// Register all Lua bindings
-void register_client_lua_bindings(lua_State* L, client_context_t* ctx) {
-    // Push client context as upvalue
-    lua_pushlightuserdata(L, ctx);
-    
-    // Create gear_client table
-    lua_newtable(L);
-    
-    // Register functions
-    lua_pushlightuserdata(L, ctx);
-    lua_pushcclosure(L, lua_send_data, 1);
-    lua_setfield(L, -2, "send");
-    
-    lua_pushlightuserdata(L, ctx);
-    lua_pushcclosure(L, lua_is_connected, 1);
-    lua_setfield(L, -2, "is_connected");
-    
-    lua_pushlightuserdata(L, ctx);
-    lua_pushcclosure(L, lua_disconnect, 1);
-    lua_setfield(L, -2, "disconnect");
-    
-    lua_pushcfunction(L, lua_log);
-    lua_setfield(L, -2, "log");
-    
-    // Set as global gear_client table
-    lua_setglobal(L, "gear_client");
+void logger_shutdown(void) {
+    log_queue_shutdown(&g_log_queue);
+    g_log_ready = 0;
 }

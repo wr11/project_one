@@ -13,6 +13,7 @@ set(ENGINE_SOURCES
     server.c
     lua_bindings.c
     bson_handler.c
+    logger.c
 )
 
 # Create executable

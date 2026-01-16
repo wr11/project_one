@@ -1,0 +1,16 @@
+{
+  "common": {
+    "log_queue_max": 10000,
+    "log_queue_warn": 8000
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "max_clients": 1000
+  },
+  "game_server": {
+    "host": "127.0.0.1",
+    "port": 9090,
+    "max_clients": 5000
+  }
+}

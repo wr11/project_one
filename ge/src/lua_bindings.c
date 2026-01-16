@@ -1,8 +1,8 @@
 #include "server.h"
+#include "logger.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 #include <limits.h>
 
 typedef struct {
@@ -124,63 +124,7 @@ static int lua_get_client_count(lua_State* L) {
     return 1;
 }
 
-typedef enum {
-    LOG_LEVEL_DEBUG = 0,
-    LOG_LEVEL_INFO,
-    LOG_LEVEL_WARN,
-    LOG_LEVEL_ERROR,
-    LOG_LEVEL_FATAL
-} log_level_t;
-
-static const char* log_level_to_string(log_level_t level) {
-    switch (level) {
-        case LOG_LEVEL_DEBUG: return "DEBUG";
-        case LOG_LEVEL_INFO: return "INFO";
-        case LOG_LEVEL_WARN: return "WARN";
-        case LOG_LEVEL_ERROR: return "ERROR";
-        case LOG_LEVEL_FATAL: return "FATAL";
-        default: return "INFO";
-    }
-}
-
-static int equals_ignore_case(const char* a, const char* b) {
-    if (!a || !b) {
-        return 0;
-    }
-    while (*a != '\0' && *b != '\0') {
-        unsigned char ca = (unsigned char)*a;
-        unsigned char cb = (unsigned char)*b;
-        if (tolower(ca) != tolower(cb)) {
-            return 0;
-        }
-        ++a;
-        ++b;
-    }
-    return *a == '\0' && *b == '\0';
-}
-
-static log_level_t parse_log_level(const char* level_str) {
-    if (!level_str) {
-        return LOG_LEVEL_INFO;
-    }
-    if (equals_ignore_case(level_str, "debug")) return LOG_LEVEL_DEBUG;
-    if (equals_ignore_case(level_str, "info")) return LOG_LEVEL_INFO;
-    if (equals_ignore_case(level_str, "warn")) return LOG_LEVEL_WARN;
-    if (equals_ignore_case(level_str, "error")) return LOG_LEVEL_ERROR;
-    if (equals_ignore_case(level_str, "fatal")) return LOG_LEVEL_FATAL;
-    return LOG_LEVEL_INFO;
-}
-
-static int ensure_directory(const char* path) {
-    uv_fs_t req;
-    int r = uv_fs_mkdir(uv_default_loop(), &req, path, 0755, NULL);
-    uv_fs_req_cleanup(&req);
-    if (r == 0 || r == UV_EEXIST) {
-        return 0;
-    }
-    return -1;
-}
-
+// Helper: find last path separator (for config path building)
 static char* find_last_path_sep(char* path) {
     char* slash = strrchr(path, '/');
     char* backslash = strrchr(path, '\\');
@@ -193,6 +137,7 @@ static char* find_last_path_sep(char* path) {
     return (slash > backslash) ? slash : backslash;
 }
 
+// Helper: get project root directory (for config path building)
 static void get_project_root(char* buffer, size_t buffer_size) {
     char exe_path[1024];
     size_t exe_size = sizeof(exe_path);
@@ -218,175 +163,204 @@ static void get_project_root(char* buffer, size_t buffer_size) {
     }
 }
 
-static int init_log_paths(char* server_file, size_t server_size) {
+// Read entire file into buffer
+static int read_file_all(const char* path, char** out, size_t* out_len) {
+    FILE* fp = fopen(path, "rb");
+    if (!fp) {
+        return -1;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return -1;
+    }
+    long size = ftell(fp);
+    if (size < 0) {
+        fclose(fp);
+        return -1;
+    }
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return -1;
+    }
+    char* buffer = (char*)malloc((size_t)size + 1);
+    if (!buffer) {
+        fclose(fp);
+        return -1;
+    }
+    size_t read_size = fread(buffer, 1, (size_t)size, fp);
+    fclose(fp);
+    if (read_size != (size_t)size) {
+        free(buffer);
+        return -1;
+    }
+    buffer[size] = '\0';
+    *out = buffer;
+    if (out_len) {
+        *out_len = (size_t)size;
+    }
+    return 0;
+}
+
+// Build config file path
+static int build_config_path(char* buffer, size_t buffer_size) {
 #ifdef _WIN32
     const char sep = '\\';
 #else
     const char sep = '/';
 #endif
-
     char project_root[1024];
     get_project_root(project_root, sizeof(project_root));
+    int n = snprintf(buffer, buffer_size, "%s%cserver%cconf%cconf.json",
+                     project_root, sep, sep, sep);
+    return (n > 0 && (size_t)n < buffer_size) ? 0 : -1;
+}
 
-    char log_dir[1152];
-    char server_dir[1184];
-    snprintf(log_dir, sizeof(log_dir), "%s%c%s", project_root, sep, "log");
-    snprintf(server_dir, sizeof(server_dir), "%s%c%s", log_dir, sep, "server");
-    snprintf(server_file, server_size, "%s%c%s", server_dir, sep, "server.log");
-
-    if (ensure_directory(log_dir) != 0 || ensure_directory(server_dir) != 0) {
-        return -1;
+// Extract number from BSON iterator
+static int bson_iter_to_size(const bson_iter_t* iter, size_t* out) {
+    if (BSON_ITER_HOLDS_INT32(iter)) {
+        int32_t v = bson_iter_int32(iter);
+        if (v > 0) {
+            *out = (size_t)v;
+            return 1;
+        }
+    } else if (BSON_ITER_HOLDS_INT64(iter)) {
+        int64_t v = bson_iter_int64(iter);
+        if (v > 0) {
+            *out = (size_t)v;
+            return 1;
+        }
+    } else if (BSON_ITER_HOLDS_DOUBLE(iter)) {
+        double v = bson_iter_double(iter);
+        if (v > 0) {
+            *out = (size_t)v;
+            return 1;
+        }
     }
     return 0;
 }
 
-static void format_timestamp(char* buffer, size_t buffer_size) {
-    uv_timespec64_t ts;
-    if (uv_clock_gettime(UV_CLOCK_REALTIME, &ts) != 0) {
-        snprintf(buffer, buffer_size, "0");
+// Apply log queue settings from config
+static void apply_log_queue_settings(const bson_t* doc) {
+    bson_iter_t iter;
+    if (!bson_iter_init_find(&iter, doc, "common") || !BSON_ITER_HOLDS_DOCUMENT(&iter)) {
         return;
     }
-    long long ms = (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000LL);
-    snprintf(buffer, buffer_size, "%lld", ms);
+    const uint8_t* data = NULL;
+    uint32_t len = 0;
+    bson_iter_document(&iter, &len, &data);
+    bson_t common;
+    bson_init_static(&common, data, len);
+
+    size_t log_queue_max = 10000;
+    size_t log_queue_warn = 8000;
+    
+    bson_iter_t c_iter;
+    if (bson_iter_init_find(&c_iter, &common, "log_queue_max")) {
+        bson_iter_to_size(&c_iter, &log_queue_max);
+    }
+    if (bson_iter_init_find(&c_iter, &common, "log_queue_warn")) {
+        bson_iter_to_size(&c_iter, &log_queue_warn);
+    }
+    
+    // Apply to logger
+    logger_set_queue_params(log_queue_max, log_queue_warn);
 }
 
-typedef struct log_node {
-    struct log_node* next;
-    size_t len;
-    char data[1];
-} log_node_t;
+// Forward declaration
+static void push_bson_value(lua_State* L, const bson_value_t* value);
 
-typedef struct log_queue {
-    uv_mutex_t mutex;
-    uv_cond_t cond;
-    log_node_t* head;
-    log_node_t* tail;
-    int running;
-    int initialized;
-    FILE* fp;
-    uv_thread_t thread;
-    int thread_started;
-} log_queue_t;
-
-static log_queue_t g_log_queue = {0};
-static int g_log_ready = 0;
-static char g_server_log_file[1216];
-
-static void log_queue_worker(void* arg) {
-    log_queue_t* q = (log_queue_t*)arg;
-    uv_mutex_lock(&q->mutex);
-    while (q->running || q->head) {
-        while (!q->head && q->running) {
-            uv_cond_wait(&q->cond, &q->mutex);
-        }
-        while (q->head) {
-            log_node_t* node = q->head;
-            q->head = node->next;
-            if (!q->head) {
-                q->tail = NULL;
-            }
-            FILE* fp = q->fp;
-            uv_mutex_unlock(&q->mutex);
-            if (fp) {
-                fwrite(node->data, 1, node->len, fp);
-            }
-            free(node);
-            uv_mutex_lock(&q->mutex);
-        }
-        if (!q->head && q->fp) {
-            fflush(q->fp);
+// Push BSON document to Lua table
+static void push_bson_document(lua_State* L, const bson_t* doc) {
+    lua_newtable(L);
+    bson_iter_t iter;
+    if (bson_iter_init(&iter, doc)) {
+        while (bson_iter_next(&iter)) {
+            const char* key = bson_iter_key(&iter);
+            lua_pushstring(L, key);
+            push_bson_value(L, bson_iter_value(&iter));
+            lua_settable(L, -3);
         }
     }
-    uv_mutex_unlock(&q->mutex);
 }
 
-static int log_queue_init(log_queue_t* q, const char* file_path) {
-    if (q->initialized) {
-        return q->fp ? 0 : -1;
+// Push BSON array to Lua table
+static void push_bson_array(lua_State* L, const bson_t* arr) {
+    lua_newtable(L);
+    bson_iter_t iter;
+    if (bson_iter_init(&iter, arr)) {
+        int index = 1;
+        while (bson_iter_next(&iter)) {
+            push_bson_value(L, bson_iter_value(&iter));
+            lua_rawseti(L, -2, index++);
+        }
     }
-    if (uv_mutex_init(&q->mutex) != 0) {
-        return -1;
-    }
-    if (uv_cond_init(&q->cond) != 0) {
-        uv_mutex_destroy(&q->mutex);
-        return -1;
-    }
-    q->fp = fopen(file_path, "a");
-    if (!q->fp) {
-        uv_cond_destroy(&q->cond);
-        uv_mutex_destroy(&q->mutex);
-        return -1;
-    }
-    q->head = NULL;
-    q->tail = NULL;
-    q->running = 1;
-    q->initialized = 1;
-    if (uv_thread_create(&q->thread, log_queue_worker, q) != 0) {
-        fclose(q->fp);
-        q->fp = NULL;
-        q->running = 0;
-        uv_cond_destroy(&q->cond);
-        uv_mutex_destroy(&q->mutex);
-        q->initialized = 0;
-        return -1;
-    }
-    q->thread_started = 1;
-    return 0;
 }
 
-static void log_queue_push(log_queue_t* q, const char* line, size_t len) {
-    if (!q->initialized || !q->fp) {
-        return;
+// Push BSON value to Lua stack
+static void push_bson_value(lua_State* L, const bson_value_t* value) {
+    switch (value->value_type) {
+        case BSON_TYPE_DOCUMENT: {
+            bson_t child;
+            bson_init_static(&child, value->value.v_doc.data, value->value.v_doc.data_len);
+            push_bson_document(L, &child);
+            break;
+        }
+        case BSON_TYPE_ARRAY: {
+            bson_t child;
+            bson_init_static(&child, value->value.v_doc.data, value->value.v_doc.data_len);
+            push_bson_array(L, &child);
+            break;
+        }
+        case BSON_TYPE_UTF8:
+            lua_pushlstring(L, value->value.v_utf8.str, value->value.v_utf8.len);
+            break;
+        case BSON_TYPE_INT32:
+            lua_pushinteger(L, value->value.v_int32);
+            break;
+        case BSON_TYPE_INT64:
+            lua_pushinteger(L, (lua_Integer)value->value.v_int64);
+            break;
+        case BSON_TYPE_DOUBLE:
+            lua_pushnumber(L, value->value.v_double);
+            break;
+        case BSON_TYPE_BOOL:
+            lua_pushboolean(L, value->value.v_bool);
+            break;
+        case BSON_TYPE_NULL:
+            lua_pushnil(L);
+            break;
+        default:
+            lua_pushnil(L);
+            break;
     }
-    log_node_t* node = (log_node_t*)malloc(sizeof(log_node_t) + len);
-    if (!node) {
-        return;
-    }
-    node->next = NULL;
-    node->len = len;
-    memcpy(node->data, line, len);
-
-    uv_mutex_lock(&q->mutex);
-    if (q->tail) {
-        q->tail->next = node;
-        q->tail = node;
-    } else {
-        q->head = node;
-        q->tail = node;
-    }
-    uv_cond_signal(&q->cond);
-    uv_mutex_unlock(&q->mutex);
 }
 
-static void log_queue_shutdown(log_queue_t* q) {
-    if (!q->initialized) {
-        return;
+// Load config and push to Lua stack, returns 1 if success, 0 if failed
+static int load_and_push_config(lua_State* L) {
+    char path[1152];
+    if (build_config_path(path, sizeof(path)) != 0) {
+        return 0;
     }
-    uv_mutex_lock(&q->mutex);
-    q->running = 0;
-    uv_cond_signal(&q->cond);
-    uv_mutex_unlock(&q->mutex);
-
-    if (q->thread_started) {
-        uv_thread_join(&q->thread);
-        q->thread_started = 0;
+    char* buffer = NULL;
+    size_t len = 0;
+    if (read_file_all(path, &buffer, &len) != 0) {
+        return 0;
     }
-
-    if (q->fp) {
-        fflush(q->fp);
-        fclose(q->fp);
-        q->fp = NULL;
+    bson_error_t error;
+    bson_t* doc = bson_new_from_json((const uint8_t*)buffer, (ssize_t)len, &error);
+    free(buffer);
+    if (!doc) {
+        fprintf(stderr, "Failed to parse config: %s\n", error.message);
+        return 0;
     }
-    uv_cond_destroy(&q->cond);
-    uv_mutex_destroy(&q->mutex);
-    q->initialized = 0;
-    q->head = NULL;
-    q->tail = NULL;
-}
-
-void log_shutdown(void) {
-    log_queue_shutdown(&g_log_queue);
-    g_log_ready = 0;
+    
+    // Apply settings to global variables
+    apply_log_queue_settings(doc);
+    
+    // Push to Lua
+    push_bson_document(L, doc);
+    bson_destroy(doc);
+    return 1;
 }
 
 // Print log (Lua binding)
@@ -403,31 +377,17 @@ static int lua_log(lua_State* L) {
         level_str = "info";
     }
 
-    log_level_t level = parse_log_level(level_str);
-    const char* level_label = log_level_to_string(level);
-    char timestamp[32];
-    char log_line[2048];
-
-    format_timestamp(timestamp, sizeof(timestamp));
-    snprintf(log_line, sizeof(log_line), "[%s] [%s] %s\n", timestamp, level_label, msg);
-
-    FILE* out = (level >= LOG_LEVEL_ERROR) ? stderr : stdout;
-    fputs(log_line, out);
-    fflush(out);
-
-    if (!g_log_ready) {
-        g_log_ready = (init_log_paths(g_server_log_file, sizeof(g_server_log_file)) == 0) &&
-                      (log_queue_init(&g_log_queue, g_server_log_file) == 0);
-    }
-    if (g_log_ready) {
-        log_queue_push(&g_log_queue, log_line, strlen(log_line));
-    }
+    log_level_t level = logger_parse_level(level_str);
+    logger_write(level, msg);
 
     return 0;
 }
 
 // Register all Lua bindings
 void register_lua_bindings(lua_State* L, server_context_t* ctx) {
+    // Initialize logger for server
+    logger_init("server");
+    
     // Push server context as upvalue
     lua_pushlightuserdata(L, ctx);
     
@@ -454,6 +414,36 @@ void register_lua_bindings(lua_State* L, server_context_t* ctx) {
 
     lua_pushcfunction(L, lua_is_closing_client);
     lua_setfield(L, -2, "is_closing");
+    
+    // Load and attach config
+    const char* process_name = "server";
+    if (load_and_push_config(L)) {
+        // Config loaded successfully, stack: [gear_table, config_table]
+        lua_pushvalue(L, -1);  // Duplicate config table
+        lua_setfield(L, -3, "config");  // gear.config = config_table
+        
+        // Extract common section
+        lua_getfield(L, -1, "common");
+        lua_setfield(L, -3, "common");  // gear.common = config.common
+        
+        // Extract process section
+        lua_getfield(L, -1, process_name);
+        lua_setfield(L, -3, "process");  // gear.process = config[process_name]
+        
+        lua_pop(L, 1);  // Pop config table
+    } else {
+        // Config load failed, set nil values
+        lua_pushnil(L);
+        lua_setfield(L, -2, "config");
+        lua_pushnil(L);
+        lua_setfield(L, -2, "common");
+        lua_pushnil(L);
+        lua_setfield(L, -2, "process");
+    }
+    
+    // Set process name
+    lua_pushstring(L, process_name);
+    lua_setfield(L, -2, "process_name");
     
     // Set as global gear table
     lua_setglobal(L, "gear");

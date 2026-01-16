@@ -1,4 +1,5 @@
 #include "server.h"
+#include "logger.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -287,7 +288,7 @@ void server_stop(server_context_t* ctx) {
 // Cleanup server
 void server_cleanup(server_context_t* ctx) {
     if (ctx->L) {
-        log_shutdown();
+        logger_shutdown();
         lua_close(ctx->L);
         ctx->L = NULL;
     }

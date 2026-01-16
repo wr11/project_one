@@ -8,6 +8,34 @@ local client_count = 0
 -- Server startup callback
 function on_server_start()
     gear.log("Chat server started!")
+    
+    -- Print configuration info
+    gear.log("=== Configuration Test ===")
+    if gear.config then
+        gear.log("✓ Config loaded successfully")
+        gear.log("Process name: " .. (gear.process_name or "unknown"))
+        
+        if gear.common then
+            gear.log("Common config:")
+            gear.log("  - log_queue_max: " .. tostring(gear.common.log_queue_max or "nil"))
+            gear.log("  - log_queue_warn: " .. tostring(gear.common.log_queue_warn or "nil"))
+        else
+            gear.log("✗ Common config not found")
+        end
+        
+        if gear.process then
+            gear.log("Process config:")
+            gear.log("  - host: " .. tostring(gear.process.host or "nil"))
+            gear.log("  - port: " .. tostring(gear.process.port or "nil"))
+            gear.log("  - max_clients: " .. tostring(gear.process.max_clients or "nil"))
+        else
+            gear.log("✗ Process config not found")
+        end
+    else
+        gear.log("✗ Config not loaded or file not found")
+    end
+    gear.log("=== End Configuration Test ===")
+    
     gear.log("Waiting for clients to connect...")
 end
 

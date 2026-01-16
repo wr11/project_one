@@ -32,7 +32,6 @@ int server_init(server_context_t* ctx, int port, const char* script_path);
 int server_start(server_context_t* ctx);
 void server_stop(server_context_t* ctx);
 void server_cleanup(server_context_t* ctx);
-void log_shutdown(void);
 
 // Lua binding functions
 void register_lua_bindings(lua_State* L, server_context_t* ctx);
