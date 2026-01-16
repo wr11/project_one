@@ -10,7 +10,6 @@
 // Client connection structure
 typedef struct {
     uv_tcp_t handle;
-    uv_write_t write_req;
     char buffer[4096];
     int buffer_len;
     struct server_context* server;
@@ -33,6 +32,7 @@ int server_init(server_context_t* ctx, int port, const char* script_path);
 int server_start(server_context_t* ctx);
 void server_stop(server_context_t* ctx);
 void server_cleanup(server_context_t* ctx);
+void log_shutdown(void);
 
 // Lua binding functions
 void register_lua_bindings(lua_State* L, server_context_t* ctx);

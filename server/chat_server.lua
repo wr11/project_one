@@ -61,14 +61,14 @@ end
 function on_client_disconnect(client)
     if clients[client] then
         local client_info = clients[client]
-        gear.log("Client disconnected: " .. client_info.name)
-        
-        -- Broadcast leave message
-        broadcast_message(client_info.name .. " left the chat", nil)
-        
-        -- Remove from clients table
+        local name = client_info.name
+        client_info.connected = false
         clients[client] = nil
         client_count = client_count - 1
+
+        gear.log("Client disconnected: " .. name)
+        -- Broadcast leave message
+        broadcast_message(name .. " left the chat", nil)
     end
     
     gear.log("Total clients: " .. gear.get_client_count())
@@ -88,7 +88,7 @@ end
 -- Broadcast message to all clients except sender
 function broadcast_message(message, exclude_client)
     for client, info in pairs(clients) do
-        if client ~= exclude_client and info.connected then
+        if client ~= exclude_client and info.connected and not gear.is_closing(client) then
             gear.send_data(client, message)
         end
     end
@@ -134,6 +134,13 @@ function handle_command(client, command)
         
     elseif cmd == "quit" then
         gear.send_data(client, "Goodbye!\n")
+        if clients[client] then
+            local name = clients[client].name
+            clients[client].connected = false
+            clients[client] = nil
+            client_count = client_count - 1
+            broadcast_message(name .. " left the chat", nil)
+        end
         gear.close_client(client)
         
     else

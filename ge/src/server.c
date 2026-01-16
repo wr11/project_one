@@ -38,15 +38,27 @@ static void on_new_connection(uv_stream_t* server, int status) {
     client->server = ctx;
     
     // Initialize TCP handle
-    uv_tcp_init(ctx->loop, &client->handle);
+    if (uv_tcp_init(ctx->loop, &client->handle) != 0) {
+        fprintf(stderr, "uv_tcp_init failed\n");
+        free(client);
+        return;
+    }
     
     // Accept connection
     if (uv_accept(server, (uv_stream_t*)&client->handle) == 0) {
         // Expand client array
         if (ctx->client_count >= ctx->client_capacity) {
-            ctx->client_capacity = ctx->client_capacity ? ctx->client_capacity * 2 : 16;
-            ctx->clients = (client_t**)realloc(ctx->clients, 
-                ctx->client_capacity * sizeof(client_t*));
+            int new_capacity = ctx->client_capacity ? ctx->client_capacity * 2 : 16;
+            client_t** new_clients = (client_t**)realloc(ctx->clients,
+                new_capacity * sizeof(client_t*));
+            if (!new_clients) {
+                fprintf(stderr, "Client list realloc failed\n");
+                uv_close((uv_handle_t*)&client->handle, NULL);
+                free(client);
+                return;
+            }
+            ctx->clients = new_clients;
+            ctx->client_capacity = new_capacity;
         }
         ctx->clients[ctx->client_count++] = client;
         
@@ -54,9 +66,15 @@ static void on_new_connection(uv_stream_t* server, int status) {
         client->handle.data = client;
         
         // Start reading data
-        uv_read_start((uv_stream_t*)&client->handle, 
-            alloc_buffer, 
-            on_read);
+        if (uv_read_start((uv_stream_t*)&client->handle,
+                alloc_buffer,
+                on_read) != 0) {
+            fprintf(stderr, "uv_read_start failed\n");
+            ctx->client_count--;
+            ctx->clients[ctx->client_count] = NULL;
+            uv_close((uv_handle_t*)&client->handle, on_client_close);
+            return;
+        }
         
         // Call Lua callback
         lua_getglobal(ctx->L, "on_client_connect");
@@ -85,12 +103,16 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
             fprintf(stderr, "Read error: %s\n", uv_strerror(nread));
         }
         uv_close((uv_handle_t*)stream, on_client_close);
-        free(buf->base);
+        if (buf->base != client->buffer) {
+            free(buf->base);
+        }
         return;
     }
     
     if (nread == 0) {
-        free(buf->base);
+        if (buf->base != client->buffer) {
+            free(buf->base);
+        }
         return;
     }
     
@@ -107,7 +129,9 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
         lua_pop(ctx->L, 1);
     }
     
-    free(buf->base);
+    if (buf->base != client->buffer) {
+        free(buf->base);
+    }
 }
 
 // Client close callback
@@ -141,7 +165,17 @@ static void on_client_close(uv_handle_t* handle) {
 
 // Allocate buffer callback
 static void alloc_buffer(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+    client_t* client = (client_t*)handle->data;
+    if (client && suggested_size <= sizeof(client->buffer)) {
+        buf->base = client->buffer;
+        buf->len = sizeof(client->buffer);
+        return;
+    }
     buf->base = (char*)malloc(suggested_size);
+    if (!buf->base) {
+        buf->len = 0;
+        return;
+    }
     buf->len = suggested_size;
 }
 
@@ -173,11 +207,13 @@ int server_init(server_context_t* ctx, int port, const char* script_path) {
         if (luaL_loadfile(ctx->L, script_path) != LUA_OK) {
             fprintf(stderr, "Failed to load script file: %s\n", lua_tostring(ctx->L, -1));
             lua_pop(ctx->L, 1);
+            server_cleanup(ctx);
             return -1;
         }
         if (lua_pcall(ctx->L, 0, 0, 0) != LUA_OK) {
             fprintf(stderr, "Script execution error: %s\n", lua_tostring(ctx->L, -1));
             lua_pop(ctx->L, 1);
+            server_cleanup(ctx);
             return -1;
         }
     }
@@ -186,11 +222,16 @@ int server_init(server_context_t* ctx, int port, const char* script_path) {
     struct sockaddr_in addr;
     uv_ip4_addr("0.0.0.0", port, &addr);
     
-    uv_tcp_init(ctx->loop, &ctx->server_handle);
+    if (uv_tcp_init(ctx->loop, &ctx->server_handle) != 0) {
+        fprintf(stderr, "Failed to init server handle\n");
+        server_cleanup(ctx);
+        return -1;
+    }
     ctx->server_handle.data = ctx;
     
     if (uv_tcp_bind(&ctx->server_handle, (const struct sockaddr*)&addr, 0)) {
         fprintf(stderr, "Failed to bind address\n");
+        server_cleanup(ctx);
         return -1;
     }
     
@@ -246,6 +287,7 @@ void server_stop(server_context_t* ctx) {
 // Cleanup server
 void server_cleanup(server_context_t* ctx) {
     if (ctx->L) {
+        log_shutdown();
         lua_close(ctx->L);
         ctx->L = NULL;
     }

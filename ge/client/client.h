@@ -24,6 +24,7 @@ int client_init(client_context_t* ctx, const char* host, int port, const char* s
 int client_connect(client_context_t* ctx);
 void client_disconnect(client_context_t* ctx);
 void client_cleanup(client_context_t* ctx);
+void log_shutdown(void);
 int client_send(client_context_t* ctx, const char* data, size_t len);
 
 // Lua binding functions

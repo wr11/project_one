@@ -37,7 +37,21 @@ else()
     )
 endif()
 
-# Set output directory
+# Set output directory to benchmark folder
 set_target_properties(stress_client PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}"
 )
+
+# Copy libuv.dll next to stress_client.exe after build (Windows)
+if(WIN32)
+    add_custom_command(TARGET stress_client POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:uv>
+            "${CMAKE_CURRENT_SOURCE_DIR}/$<TARGET_FILE_NAME:uv>"
+        COMMENT "Copying libuv.dll to benchmark directory"
+    )
+endif()

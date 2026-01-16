@@ -250,6 +250,7 @@ void client_cleanup(client_context_t* ctx) {
     }
     
     if (ctx->L) {
+        log_shutdown();
         lua_close(ctx->L);
         ctx->L = NULL;
     }

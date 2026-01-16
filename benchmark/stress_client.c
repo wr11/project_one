@@ -295,7 +295,7 @@ int main(int argc, char* argv[]) {
     // Start periodic stats printing
     uv_timer_t stats_timer;
     uv_timer_init(g_loop, &stats_timer);
-    uv_timer_start(&stats_timer, print_stats_timer, 5000, 5000); // Print every 5 seconds
+    uv_timer_start(&stats_timer, print_stats_timer, 1000, 1000); // Print every 1 second
     
     // Run event loop
     // Register signal handlers

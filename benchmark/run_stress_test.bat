@@ -64,3 +64,5 @@ timeout /t 2 /nobreak >nul
 echo.
 
 echo All tests completed!
+
+pause
