@@ -12,9 +12,15 @@ typedef enum {
     LOG_LEVEL_FATAL
 } log_level_t;
 
-// Initialize logger with process type and config
+// Initialize logger with process type and optional process name
 // process_type: "server" or "client"
-void logger_init(const char* process_type);
+// process_name: optional process name for server (e.g., "gate", "game", "chat")
+//               if NULL, uses process_type as name
+// Example:
+//   logger_init("server", "gate")  -> log/server/gate/gate.log
+//   logger_init("server", NULL)    -> log/server/server/server.log
+//   logger_init("client", NULL)    -> log/client/client.log
+void logger_init(const char* process_type, const char* process_name);
 
 // Set queue parameters (must be called before first log)
 void logger_set_queue_params(size_t max_count, size_t warn_threshold);

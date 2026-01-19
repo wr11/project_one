@@ -26,46 +26,83 @@ static void signal_handler(int sig) {
     server_stop(&g_server);
 }
 
+// Print usage information
+static void print_usage(const char* program_name) {
+    printf("Usage: %s <process_name> [script_path] [config_path]\n", program_name);
+    printf("\n");
+    printf("Arguments:\n");
+    printf("  process_name  - Process name for logging (e.g., gate, game, chat)\n");
+    printf("                  This determines the log directory: log/server/<process_name>/\n");
+    printf("  script_path   - Path to Lua script (default: ../ge/example/example_server/chat_server.lua)\n");
+    printf("  config_path   - Path to config file (default: conf/conf.json)\n");
+    printf("\n");
+    printf("Examples:\n");
+    printf("  %s gate\n", program_name);
+    printf("  %s gate gate_server.lua\n", program_name);
+    printf("  %s gate gate_server.lua ../conf/gate.json\n", program_name);
+    printf("\n");
+}
+
 int main(int argc, char* argv[]) {
-    int port = 8080;
+    const char* process_name = NULL;
     const char* script_path = NULL;
-    
-    // Default script path: ../server/chat_server.lua (relative to executable)
-    // This assumes executable is in server/ directory
-    const char* default_script = "chat_server.lua";
-    
+    const char* config_path = NULL;
+    int port = 8080;
+
+    // Default paths
+    const char* default_script = "../ge/example/example_server/chat_server.lua";
+    const char* default_config = "conf/conf.json";
+
     // Parse command line arguments
-    if (argc > 1) {
-        port = atoi(argv[1]);
+    // Usage: ge <process_name> [script_path] [config_path]
+    if (argc < 2) {
+        fprintf(stderr, "Error: Process name is required\n\n");
+        print_usage(argv[0]);
+        return 1;
     }
+
+    // Argument 1: process_name (required)
+    process_name = argv[1];
+
+    // Argument 2: script_path (optional)
     if (argc > 2) {
         script_path = argv[2];
     } else {
-        // Use default script if not specified
         script_path = default_script;
     }
-    
+
+    // Argument 3: config_path (optional)
+    if (argc > 3) {
+        config_path = argv[3];
+    } else {
+        config_path = default_config;
+    }
+
     // Register signal handlers
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
-    
+
     // Initialize server
-    if (server_init(&g_server, port, script_path) != 0) {
+    if (server_init(&g_server, port, script_path, process_name, config_path) != 0) {
         fprintf(stderr, "Server initialization failed\n");
         return 1;
     }
-    
+
     // Start server
-    printf("ge (GearEngine) server starting...\n");
-    printf("Port: %d\n", port);
-    if (script_path) {
-        printf("Script: %s\n", script_path);
-    }
-    
+    printf("========================================\n");
+    printf("ge (GearEngine) Server\n");
+    printf("========================================\n");
+    printf("Process:  %s\n", process_name);
+    printf("Port:     %d\n", port);
+    printf("Script:   %s\n", script_path);
+    printf("Config:   %s\n", config_path);
+    printf("Log:      log/server/%s/%s.log\n", process_name, process_name);
+    printf("========================================\n");
+
     int r = server_start(&g_server);
-    
+
     // Cleanup
     server_cleanup(&g_server);
-    
+
     return r;
 }

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake --build:*)",
+      "Bash(./ge.exe)",
+      "Bash(timeout 3:*)",
+      "Bash(timeout 1 ./ge.exe:*)",
+      "Bash(timeout:*)"
+    ]
+  }
+}

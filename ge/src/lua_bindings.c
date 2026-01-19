@@ -11,6 +11,35 @@ typedef struct {
     char* data;
 } write_req_t;
 
+// Helper: Validate client pointer from Lua
+static int is_client_valid_lua(client_t* client) {
+    return client != NULL &&
+           client->magic == CLIENT_MAGIC &&
+           client->is_valid;
+}
+
+// Helper: Safe Lua function call with error handling
+static int safe_lua_call(lua_State* L, const char* func_name, int nargs) {
+    lua_getglobal(L, func_name);
+    if (!lua_isfunction(L, -nargs - 1)) {
+        lua_pop(L, nargs + 1);
+        return -1;
+    }
+
+    // Move function before arguments
+    if (nargs > 0) {
+        lua_insert(L, -nargs - 1);
+    }
+
+    if (lua_pcall(L, nargs, 0, 0) != LUA_OK) {
+        fprintf(stderr, "Lua error in %s: %s\n", func_name, lua_tostring(L, -1));
+        lua_pop(L, 1);
+        return -1;
+    }
+
+    return 0;
+}
+
 static void on_write_done(uv_write_t* req, int status) {
     write_req_t* wr = (write_req_t*)req;
     if (status < 0) {
@@ -21,7 +50,7 @@ static void on_write_done(uv_write_t* req, int status) {
 }
 
 static int send_buffer(lua_State* L, client_t* client, const char* data, size_t len) {
-    if (!client) {
+    if (!is_client_valid_lua(client)) {
         lua_pushboolean(L, 0);
         lua_pushstring(L, "Invalid client");
         return 2;
@@ -31,7 +60,7 @@ static int send_buffer(lua_State* L, client_t* client, const char* data, size_t 
         lua_pushstring(L, "Client is closing");
         return 2;
     }
-    if (len > (size_t)UINT_MAX) {
+    if (len > CLIENT_BUFFER_SIZE - MESSAGE_HEADER_SIZE) {
         lua_pushboolean(L, 0);
         lua_pushstring(L, "Data too large");
         return 2;
@@ -41,21 +70,31 @@ static int send_buffer(lua_State* L, client_t* client, const char* data, size_t 
         return 1;
     }
 
+    // Allocate buffer for header + data
+    size_t total_len = MESSAGE_HEADER_SIZE + len;
     write_req_t* wr = (write_req_t*)malloc(sizeof(write_req_t));
     if (!wr) {
         lua_pushboolean(L, 0);
         lua_pushstring(L, "Out of memory");
         return 2;
     }
-    wr->data = (char*)malloc(len);
+
+    wr->data = (char*)malloc(total_len);
     if (!wr->data) {
         free(wr);
         lua_pushboolean(L, 0);
         lua_pushstring(L, "Out of memory");
         return 2;
     }
-    memcpy(wr->data, data, len);
-    wr->buf = uv_buf_init(wr->data, (unsigned int)len);
+
+    // Write length header (little-endian 32-bit)
+    uint32_t msg_len = (uint32_t)len;
+    memcpy(wr->data, &msg_len, sizeof(uint32_t));
+
+    // Write message body
+    memcpy(wr->data + MESSAGE_HEADER_SIZE, data, len);
+
+    wr->buf = uv_buf_init(wr->data, (unsigned int)total_len);
 
     int r = uv_write(&wr->req, (uv_stream_t*)&client->handle, &wr->buf, 1, on_write_done);
     if (r != 0) {
@@ -92,15 +131,19 @@ static int lua_send_bson(lua_State* L) {
 // Close client connection (Lua binding)
 static int lua_close_client(lua_State* L) {
     client_t* client = (client_t*)lua_touserdata(L, 1);
-    
-    if (!client) {
+
+    if (!is_client_valid_lua(client)) {
         lua_pushboolean(L, 0);
         lua_pushstring(L, "Invalid client");
         return 2;
     }
-    
+
     if (!uv_is_closing((uv_handle_t*)&client->handle)) {
-        uv_close((uv_handle_t*)&client->handle, NULL);
+        // Mark as invalid before closing
+        client->is_valid = 0;
+        uv_timer_stop(&client->idle_timer);
+        // Use proper close callback
+        uv_close((uv_handle_t*)&client->handle, on_client_close);
     }
     lua_pushboolean(L, 1);
     return 1;
@@ -109,8 +152,8 @@ static int lua_close_client(lua_State* L) {
 // Check if client is closing (Lua binding)
 static int lua_is_closing_client(lua_State* L) {
     client_t* client = (client_t*)lua_touserdata(L, 1);
-    if (!client) {
-        lua_pushboolean(L, 1);
+    if (!is_client_valid_lua(client)) {
+        lua_pushboolean(L, 1);  // Invalid client is considered as closing
         return 1;
     }
     lua_pushboolean(L, uv_is_closing((uv_handle_t*)&client->handle));
@@ -336,11 +379,18 @@ static void push_bson_value(lua_State* L, const bson_value_t* value) {
 }
 
 // Load config and push to Lua stack, returns 1 if success, 0 if failed
-static int load_and_push_config(lua_State* L) {
+static int load_and_push_config(lua_State* L, const char* config_path) {
     char path[1152];
-    if (build_config_path(path, sizeof(path)) != 0) {
-        return 0;
+
+    // Use provided config_path if available, otherwise build default path
+    if (config_path) {
+        snprintf(path, sizeof(path), "%s", config_path);
+    } else {
+        if (build_config_path(path, sizeof(path)) != 0) {
+            return 0;
+        }
     }
+
     char* buffer = NULL;
     size_t len = 0;
     if (read_file_all(path, &buffer, &len) != 0) {
@@ -386,7 +436,8 @@ static int lua_log(lua_State* L) {
 // Register all Lua bindings
 void register_lua_bindings(lua_State* L, server_context_t* ctx) {
     // Initialize logger for server
-    logger_init("server");
+    // Use process_name from context (passed from command-line)
+    logger_init("server", ctx->process_name);
     
     // Push server context as upvalue
     lua_pushlightuserdata(L, ctx);
@@ -416,8 +467,8 @@ void register_lua_bindings(lua_State* L, server_context_t* ctx) {
     lua_setfield(L, -2, "is_closing");
     
     // Load and attach config
-    const char* process_name = "server";
-    if (load_and_push_config(L)) {
+    const char* process_name = ctx->process_name ? ctx->process_name : "server";
+    if (load_and_push_config(L, ctx->config_path)) {
         // Config loaded successfully, stack: [gear_table, config_table]
         lua_pushvalue(L, -1);  // Duplicate config table
         lua_setfield(L, -3, "config");  // gear.config = config_table

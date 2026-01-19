@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 #include <uv.h>
 
 // Log queue structures
@@ -36,6 +37,7 @@ static char g_log_file_path[1216];
 static size_t g_log_queue_max = 10000;
 static size_t g_log_queue_warn = 8000;
 static const char* g_process_type = "server";
+static const char* g_process_name = NULL;
 
 // Helper: case-insensitive string comparison
 static int equals_ignore_case(const char* a, const char* b) {
@@ -115,27 +117,58 @@ static int init_log_paths(const char* process_type) {
     char project_root[1024];
     get_project_root(project_root, sizeof(project_root));
 
-    char log_dir[1152];
-    char type_dir[1184];
-    snprintf(log_dir, sizeof(log_dir), "%s%c%s", project_root, sep, "log");
-    snprintf(type_dir, sizeof(type_dir), "%s%c%s", log_dir, sep, process_type);
-    snprintf(g_log_file_path, sizeof(g_log_file_path), "%s%c%s.log", type_dir, sep, process_type);
+    // Determine the actual process name to use
+    const char* name = g_process_name ? g_process_name : process_type;
 
-    if (ensure_directory(log_dir) != 0 || ensure_directory(type_dir) != 0) {
+    char log_dir[1152];      // log/
+    char type_dir[1184];     // log/server/ or log/client/
+    char process_dir[1216];  // log/server/gate/ or log/server/server/
+
+    // Create directory structure: log/[type]/[name]/
+    snprintf(log_dir, sizeof(log_dir), "%s%clog", project_root, sep);
+    snprintf(type_dir, sizeof(type_dir), "%s%c%s", log_dir, sep, process_type);
+    snprintf(process_dir, sizeof(process_dir), "%s%c%s", type_dir, sep, name);
+    snprintf(g_log_file_path, sizeof(g_log_file_path), "%s%c%s.log", process_dir, sep, name);
+
+    // Create all necessary directories
+    if (ensure_directory(log_dir) != 0 ||
+        ensure_directory(type_dir) != 0 ||
+        ensure_directory(process_dir) != 0) {
         return -1;
     }
     return 0;
 }
 
-// Helper: format timestamp
+// Helper: format timestamp in ISO 8601 format with milliseconds
 static void format_timestamp(char* buffer, size_t buffer_size) {
     uv_timespec64_t ts;
     if (uv_clock_gettime(UV_CLOCK_REALTIME, &ts) != 0) {
         snprintf(buffer, buffer_size, "0");
         return;
     }
-    long long ms = (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000LL);
-    snprintf(buffer, buffer_size, "%lld", ms);
+
+    time_t sec = (time_t)ts.tv_sec;
+    int ms = (int)(ts.tv_nsec / 1000000LL);
+
+#ifdef _WIN32
+    struct tm local_tm;
+    if (localtime_s(&local_tm, &sec) != 0) {
+        snprintf(buffer, buffer_size, "%lld", (long long)ts.tv_sec * 1000LL + ms);
+        return;
+    }
+    snprintf(buffer, buffer_size, "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+             local_tm.tm_year + 1900, local_tm.tm_mon + 1, local_tm.tm_mday,
+             local_tm.tm_hour, local_tm.tm_min, local_tm.tm_sec, ms);
+#else
+    struct tm local_tm;
+    if (localtime_r(&sec, &local_tm) == NULL) {
+        snprintf(buffer, buffer_size, "%lld", (long long)ts.tv_sec * 1000LL + ms);
+        return;
+    }
+    snprintf(buffer, buffer_size, "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+             local_tm.tm_year + 1900, local_tm.tm_mon + 1, local_tm.tm_mday,
+             local_tm.tm_hour, local_tm.tm_min, local_tm.tm_sec, ms);
+#endif
 }
 
 // Log queue worker thread
@@ -154,9 +187,10 @@ static void log_queue_worker(void* arg) {
             }
             q->count--;
             FILE* fp = q->fp;
+            int still_running = q->running;
             uv_cond_signal(&q->cond_not_full);
             uv_mutex_unlock(&q->mutex);
-            if (fp) {
+            if (fp && still_running) {
                 fwrite(node->data, 1, node->len, fp);
             }
             free(node);
@@ -221,7 +255,7 @@ static int log_queue_init(log_queue_t* q, const char* file_path) {
     return 0;
 }
 
-// Push log to queue
+// Push log to queue (non-blocking, drops logs if queue is full)
 static void log_queue_push(log_queue_t* q, const char* line, size_t len) {
     if (!q->initialized || !q->fp) {
         return;
@@ -235,14 +269,24 @@ static void log_queue_push(log_queue_t* q, const char* line, size_t len) {
     memcpy(node->data, line, len);
 
     uv_mutex_lock(&q->mutex);
-    while (q->count >= q->max_count && q->running) {
-        uv_cond_wait(&q->cond_not_full, &q->mutex);
+
+    // Drop log if queue is full (non-blocking behavior)
+    if (q->count >= q->max_count) {
+        if (!q->warn_emitted) {
+            fprintf(stderr, "[log] Queue full (%zu/%zu), dropping logs\n", q->count, q->max_count);
+            q->warn_emitted = 1;
+        }
+        uv_mutex_unlock(&q->mutex);
+        free(node);
+        return;
     }
+
     if (!q->running) {
         uv_mutex_unlock(&q->mutex);
         free(node);
         return;
     }
+
     if (q->tail) {
         q->tail->next = node;
         q->tail = node;
@@ -251,10 +295,12 @@ static void log_queue_push(log_queue_t* q, const char* line, size_t len) {
         q->tail = node;
     }
     q->count++;
+
     if (!q->warn_emitted && q->count >= q->warn_threshold) {
-        fprintf(stderr, "[log] queue near limit: %zu/%zu\n", q->count, q->max_count);
+        fprintf(stderr, "[log] Queue near limit: %zu/%zu\n", q->count, q->max_count);
         q->warn_emitted = 1;
     }
+
     uv_cond_signal(&q->cond_not_empty);
     uv_mutex_unlock(&q->mutex);
 }
@@ -264,8 +310,13 @@ static void log_queue_shutdown(log_queue_t* q) {
     if (!q->initialized) {
         return;
     }
+
+    FILE* fp_to_close = NULL;
+
     uv_mutex_lock(&q->mutex);
     q->running = 0;
+    fp_to_close = q->fp;
+    q->fp = NULL;
     uv_cond_broadcast(&q->cond_not_empty);
     uv_cond_broadcast(&q->cond_not_full);
     uv_mutex_unlock(&q->mutex);
@@ -275,10 +326,9 @@ static void log_queue_shutdown(log_queue_t* q) {
         q->thread_started = 0;
     }
 
-    if (q->fp) {
-        fflush(q->fp);
-        fclose(q->fp);
-        q->fp = NULL;
+    if (fp_to_close) {
+        fflush(fp_to_close);
+        fclose(fp_to_close);
     }
     uv_cond_destroy(&q->cond_not_full);
     uv_cond_destroy(&q->cond_not_empty);
@@ -314,9 +364,14 @@ log_level_t logger_parse_level(const char* level_str) {
     return LOG_LEVEL_INFO;
 }
 
-void logger_init(const char* process_type) {
+void logger_init(const char* process_type, const char* process_name) {
     if (process_type) {
         g_process_type = process_type;
+    }
+    if (process_name) {
+        g_process_name = process_name;
+    } else {
+        g_process_name = NULL;  // Use process_type as default
     }
 }
 
