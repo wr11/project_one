@@ -18,8 +18,8 @@
 typedef struct {
     uv_tcp_t handle;
     char buffer[CLIENT_BUFFER_SIZE];
-    int buffer_used;             // Bytes used in receive buffer
-    int expected_length;         // Expected message length (from header)
+    size_t buffer_used;          // Bytes used in receive buffer
+    size_t expected_length;      // Expected message length (from header)
     struct server_context* server;
     int array_index;             // Index in server's client array (for O(1) removal)
     uint32_t magic;              // Magic number for validity check

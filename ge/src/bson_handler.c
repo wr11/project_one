@@ -42,21 +42,30 @@ int bson_to_buffer(bson_t* bson, char* buffer, int buffer_size) {
     return len;
 }
 
-// Create BSON document from Lua table (helper function)
-bson_t* bson_from_lua_table(lua_State* L, int index) {
-    bson_t* bson = bson_new();
-    bson_t child;
-    
+// Forward declaration for recursive processing
+static int append_lua_table_to_bson(lua_State* L, int index, bson_t* bson);
+
+// Helper: recursively append Lua table contents to BSON document
+static int append_lua_table_to_bson(lua_State* L, int index, bson_t* bson) {
     if (!lua_istable(L, index)) {
-        bson_destroy(bson);
-        return NULL;
+        return -1;
     }
-    
+
+    // Normalize index to absolute (handles negative indices)
+    if (index < 0) {
+        index = lua_gettop(L) + index + 1;
+    }
+
     lua_pushnil(L);
     while (lua_next(L, index) != 0) {
         const char* key = lua_tostring(L, -2);
+        if (!key) {
+            lua_pop(L, 1);
+            continue;
+        }
+
         int type = lua_type(L, -1);
-        
+
         switch (type) {
             case LUA_TNUMBER:
                 if (lua_isinteger(L, -1)) {
@@ -71,16 +80,38 @@ bson_t* bson_from_lua_table(lua_State* L, int index) {
             case LUA_TBOOLEAN:
                 BSON_APPEND_BOOL(bson, key, lua_toboolean(L, -1));
                 break;
-            case LUA_TTABLE:
+            case LUA_TTABLE: {
+                bson_t child;
                 BSON_APPEND_DOCUMENT_BEGIN(bson, key, &child);
-                // Recursively process nested table (simplified version)
-                // Note: No BSON_APPEND_DOCUMENT_END macro, use function directly
+                // Recursively process nested table
+                append_lua_table_to_bson(L, -1, &child);
                 bson_append_document_end(bson, &child);
                 break;
+            }
+            default:
+                // Ignore unsupported types (functions, userdata, etc.)
+                break;
         }
-        
+
         lua_pop(L, 1);
     }
-    
+
+    return 0;
+}
+
+// Create BSON document from Lua table (helper function)
+bson_t* bson_from_lua_table(lua_State* L, int index) {
+    bson_t* bson = bson_new();
+
+    if (!lua_istable(L, index)) {
+        bson_destroy(bson);
+        return NULL;
+    }
+
+    if (append_lua_table_to_bson(L, index, bson) != 0) {
+        bson_destroy(bson);
+        return NULL;
+    }
+
     return bson;
 }

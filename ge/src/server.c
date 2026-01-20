@@ -138,6 +138,8 @@ static void on_new_connection(uv_stream_t* server, int status) {
             fprintf(stderr, "uv_timer_start failed\n");
             ctx->client_count--;
             invalidate_client(client);
+            // Close both timer and handle
+            uv_close((uv_handle_t*)&client->idle_timer, NULL);
             uv_close((uv_handle_t*)&client->handle, on_client_close);
             return;
         }
@@ -150,6 +152,8 @@ static void on_new_connection(uv_stream_t* server, int status) {
             ctx->client_count--;
             uv_timer_stop(&client->idle_timer);
             invalidate_client(client);
+            // Close both timer and handle
+            uv_close((uv_handle_t*)&client->idle_timer, NULL);
             uv_close((uv_handle_t*)&client->handle, on_client_close);
             return;
         }
@@ -244,9 +248,10 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
 
             // Check if we now have a complete header
             if (client->buffer_used == MESSAGE_HEADER_SIZE) {
-                // Read length (little-endian 32-bit integer)
-                uint32_t msg_len;
-                memcpy(&msg_len, client->buffer, sizeof(uint32_t));
+                // Read length (network byte order - big-endian 32-bit integer)
+                uint32_t msg_len_net;
+                memcpy(&msg_len_net, client->buffer, sizeof(uint32_t));
+                uint32_t msg_len = ntohl(msg_len_net);  // Convert from network to host byte order
 
                 // Validate message length
                 if (msg_len == 0 || msg_len > CLIENT_BUFFER_SIZE - MESSAGE_HEADER_SIZE) {
@@ -258,13 +263,13 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                     return;
                 }
 
-                client->expected_length = msg_len;
+                client->expected_length = (size_t)msg_len;
             }
             continue;
         }
 
         // We have a header, now accumulate message body
-        int total_expected = MESSAGE_HEADER_SIZE + client->expected_length;
+        size_t total_expected = MESSAGE_HEADER_SIZE + client->expected_length;
         size_t to_copy = total_expected - client->buffer_used;
         if (to_copy > remaining) {
             to_copy = remaining;
@@ -330,6 +335,11 @@ void on_client_close(uv_handle_t* handle) {
     // Invalidate client
     invalidate_client(client);
 
+    // Close timer if not already closing
+    if (!uv_is_closing((uv_handle_t*)&client->idle_timer)) {
+        uv_close((uv_handle_t*)&client->idle_timer, NULL);
+    }
+
     // Free client structure
     free(client);
 }
@@ -355,10 +365,34 @@ int server_init(server_context_t* ctx, int port, const char* script_path,
     memset(ctx, 0, sizeof(server_context_t));
 
     ctx->port = port;
-    ctx->script_path = script_path ? strdup(script_path) : NULL;
-    ctx->process_name = process_name ? strdup(process_name) : NULL;
-    ctx->config_path = config_path ? strdup(config_path) : NULL;
-    
+
+    // Duplicate strings and check for allocation failures
+    if (script_path) {
+        ctx->script_path = strdup(script_path);
+        if (!ctx->script_path) {
+            fprintf(stderr, "Failed to allocate memory for script_path\n");
+            return -1;
+        }
+    }
+
+    if (process_name) {
+        ctx->process_name = strdup(process_name);
+        if (!ctx->process_name) {
+            fprintf(stderr, "Failed to allocate memory for process_name\n");
+            server_cleanup(ctx);
+            return -1;
+        }
+    }
+
+    if (config_path) {
+        ctx->config_path = strdup(config_path);
+        if (!ctx->config_path) {
+            fprintf(stderr, "Failed to allocate memory for config_path\n");
+            server_cleanup(ctx);
+            return -1;
+        }
+    }
+
     // Create event loop
     ctx->loop = uv_default_loop();
     
@@ -436,9 +470,17 @@ int server_start(server_context_t* ctx) {
     return uv_run(ctx->loop, UV_RUN_DEFAULT);
 }
 
+// Server handle close callback
+static void on_server_close(uv_handle_t* handle) {
+    // Server handle closed, no additional cleanup needed here
+    // The actual cleanup happens in server_cleanup()
+}
+
 // Stop server
 void server_stop(server_context_t* ctx) {
-    uv_close((uv_handle_t*)&ctx->server_handle, NULL);
+    if (!uv_is_closing((uv_handle_t*)&ctx->server_handle)) {
+        uv_close((uv_handle_t*)&ctx->server_handle, on_server_close);
+    }
 
     // Close all client connections
     for (int i = 0; i < ctx->client_count; i++) {
